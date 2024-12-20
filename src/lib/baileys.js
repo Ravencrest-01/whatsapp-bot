@@ -1,66 +1,82 @@
-// Have to implement logic on line 51 to display the names for user
-
-const { default: makeWASocket, useSingleFileAuthState } = require('@adiwajshing/baileys')
-const { state, saveState } = useSingleFileAuthState('./auth_info.json')
-const messageHandler = require('../events/messageHandler')
-const { loadProfiles, saveProfiles } = require('./storage')
-
-
-async function startBot() {
-    const sock = makeWASocket({ auth:state })
-
-    // Saving updated credentials whenever they are updated
+const { 
+    default: makeWASocket, 
+    useSingleFileAuthState, 
+    makeInMemoryStore 
+  } = require('@adiwajshing/baileys')
+  const { state, saveState } = useSingleFileAuthState('./auth_info.json')
+  const messageHandler = require('../events/messageHandler')
+  const { loadProfiles, saveProfiles } = require('./storage')
+  const pino = require('pino')
+  
+  // Create an in-memory store to keep track of contacts, chats, etc.
+  const store = makeInMemoryStore({ logger: pino().child({ level: 'silent', stream: 'store' }) })
+  
+  async function startBot() {
+    // Create the WhatsApp connection/socket
+    const sock = makeWASocket({ 
+      auth: state,
+      // You can print QR in terminal to scan the first time.
+      printQRInTerminal: true
+    })
+  
+    // Bind the store to the socket, so it updates automatically
+    store.bind(sock.ev)
+  
+    // Handle credential updates (for re-login without QR code next time)
     sock.ev.on('creds.update', saveState)
-
-    // Listen to the new incomming messages or updates in the messages.
-    // 'message.upsert' is triggered when there are new messages or edited messages.
-    sock.ev.on('message.upsert', async({messages}) => {
-        // check for the messages
-        if(!messages || !messages[0]) return
-        const msg = messages[0]
-
-        // Pass the message and socket to the central 'messageHandler' it'll, parse the message, check if its a command or not, excecute the command
-        await messageHandler(sock, msg)
+  
+    // Handle incoming messages
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+      if (!messages || !messages[0]) return
+      const msg = messages[0]
+      await messageHandler(sock, msg)
     })
-
-    // For fetching the participants and their numbers for the particular group
-    const groupId = '120363272799739119@g.us'
-
-    // fetch metadata about group. (its name, participants etc.)
+  
+    // Now, fetch group participants to auto-log them:
+    const groupId = '120363272799739119@g.us' // e.g. '1234567890-123456@g.us'
     const groupMeta = await sock.groupMetadata(groupId)
-
-    // groupMeta.participants is an array of objects. Each participant has at least an 'id' their phone number in whatsapp JID form.
-    // we map over each participant to create a simplified structure for storing in profiles
-    const participants = groupMeta.participants.map(p => {
-        return {
-            id: p.id,
-            // we start with the empty role. we can add roles later via commands
-            roles: []
-        }
-    })
-
-    // Load the current profiles from the storage (profiles.json)
+  
+    // groupMeta.participants is an array of { id: string, admin?: string }
+    // We want to store their display names if available.
+    // We'll rely on `store.contacts` to find names.
+    
     let profiles = loadProfiles()
-
-    // For each participant in the group: Check if they are already in profiles. If not, add them with empty roles. This will help in not overwriting the existing user.
-    participants.forEach(newUser => {
-        const existingUser = profiles.find(u => u.id === newUser.id)
-        if(!existingUser){
-            profiles.push({
-                id: newUser.id,
-                name: null, //Implementing Logic to display the name will have to do soon
-                roles: [] //start with no roles for existing user
-            })
+  
+    for (const participant of groupMeta.participants) {
+      const existingUser = profiles.find(u => u.id === participant.id)
+  
+      // Attempt to find a display name from contacts
+      // store.contacts is a dictionary keyed by user JID
+      // Each contact may have { name, notify } fields.
+      const contact = store.contacts[participant.id]
+  
+      let displayName = null
+      if (contact) {
+        // 'notify' is often the pushName set by the user, more likely to be their display name
+        // 'name' can also be present, depending on how Baileys fetches the contact
+        displayName = contact.notify || contact.name || null
+      }
+  
+      // If user is new, add them with a name (if found)
+      if (!existingUser) {
+        profiles.push({
+          id: participant.id,
+          name: displayName,
+          roles: []
+        })
+      } else {
+        // If user already exists but we previously had no name, we can update their name now
+        if (!existingUser.name && displayName) {
+          existingUser.name = displayName
         }
-        // if user aleardy exists in profiles, do nothing and preserving the data.
-    })
-
-    // save the updated profiles back to the profiles.json file.
+      }
+    }
+  
+    // Save updated profiles
     saveProfiles(profiles)
-    console.log("All the group members have been logged to profiles.json!")
-
-    // return the socket connection
+    console.log('All group participants have been logged with display names (if available) to profiles.json!')
+  
     return sock
-}
-
-module.exports = startBot
+  }
+  
+  module.exports = startBot  
